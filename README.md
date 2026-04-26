@@ -29,20 +29,16 @@
 
 ## ⚡ The numbers
 
-| | Single-stream t/s | Hardware | Cost |
-|---|---|---|---|
-| 🟩 *DGX Spark FP8 baseline (no spec)* | 7.8 | NVIDIA GB10 Blackwell | ≈ $4 000 |
-| 🟩 *Our BF16 sibling repo, no spec* | 4.3 | AMD Strix Halo | ≈ $1 500 |
-| 🟩 *Our AWQ4, no spec (this repo, baseline)* | 5.6 | AMD Strix Halo | ≈ $1 500 |
-| 🟧 *DGX Spark FP8 + DFlash + MTP (claimed)* | 20-25 | NVIDIA GB10 Blackwell | ≈ $4 000 |
-| 🟥 **Our AWQ4 + DFlash N=8 (this repo)** | **24.8 peak / 18.5 mean** | **AMD Strix Halo** | **≈ $1 500** |
-| ⚪ *DGX Spark NVFP4 + DFlash, Blackwell-locked* | 83.9 median | NVIDIA GB10 sm_121a only | ≈ $4 000 |
+| | Single-stream t/s | Hardware |
+|---|---|---|
+| 🟩 *DGX Spark FP8 baseline (no spec)* | 7.8 | NVIDIA GB10 Blackwell |
+| 🟩 *Our BF16 sibling repo, no spec* | 4.3 | AMD Strix Halo |
+| 🟩 *Our AWQ4, no spec (this repo, baseline)* | 5.6 | AMD Strix Halo |
+| 🟧 *DGX Spark FP8 + DFlash + MTP (claimed)* | 20-25 | NVIDIA GB10 Blackwell |
+| 🟥 **Our AWQ4 + DFlash N=8 (this repo)** | **24.8 peak / 18.5 mean** | **AMD Strix Halo** |
+| ⚪ *DGX Spark NVFP4 + DFlash, Blackwell-locked* | 83.9 median | NVIDIA GB10 sm_121a only |
 
-**On any vendor-portable / upstream-vLLM path, AMD Strix Halo iGPU at $1500 matches NVIDIA DGX Spark at $4000 on Qwen 3.6-27B.**
-
-We do *not* beat **Blackwell-specific NVFP4**  -  that uses sm_121a-only kernels not portable to any other GPU (not even other NVIDIA cards). See [vs DGX Spark](#-vs-dgx-spark--honest-comparison) for sources.
-
-> **+340% over no-spec baseline**  -  *5.6 → 24.8 t/s* on `/v1/responses`, single-stream, full 256K context, on a fanless integrated GPU.
+> **+340% over no-spec baseline** - *5.6 → 24.8 t/s* on `/v1/responses`, single-stream, full 256K context, on a fanless integrated GPU.
 
 ---
 
@@ -108,7 +104,6 @@ Per-position acceptance falls off as N grows (drafter is less confident predicti
 | Vision support | ✅ | ✅ | ✅ |
 | Hardware | AMD iGPU, ROCm 7.13 | NVIDIA GB10 Blackwell | NVIDIA GB10 Blackwell sm_121a |
 | Stack | Upstream vLLM v0.20.0 + 16 patches | Upstream vLLM | Custom CUDA 13 + FlashInfer 0.6.8 + sm_121a-only |
-| Cost | **≈ $1 500** | ≈ $4 000 | ≈ $4 000 |
 | Open source toolchain | 100% | mostly | partly (NVFP4 kernels are NVIDIA's) |
 
 **Sources cited above:**
@@ -322,84 +317,6 @@ These are gfx1151-driven, not quant-driven. Same patches the BF16 sibling repo u
 
 ---
 
-## ⚠️ Limits & honest caveats
-
-- **Single-stream only configured** (`--max-num-seqs 1`). Open it to 4-10 for aggregate throughput.
-- **Drafter is gated** on HuggingFace  -  manual approval required, no ungated mirror.
-- **Streaming tool calls have known upstream bugs** (vLLM PRs #40785, #40787 closed unmerged). Use non-streaming.
-- **Triton JIT cold-start ≈ 8-10 min.** Persisted to `./.triton-cache`, warm restarts < 30 s.
-- **DFlash acceptance drops past N≈8** (drafter less accurate further ahead). N=15 may give marginal further gain; we stopped at N=8 (best steady-state on chat is 19.8 t/s, on `/v1/responses` is 24.8).
-- **Numbers in this README are wall-clock client-side.** vLLM internal generation throughput is ≈ 25-27 t/s on these workloads (engine excludes round-trip + initial prefill).
-- **HIP graphs freeze on gfx1151**  -  `--enforce-eager` mandatory.
-- **Official `Qwen/Qwen3.6-27B-FP8` doesn't init** on RDNA 3.5 (Triton w8a8 autotune stall on the hybrid model's DeltaNet partitions). AWQ-INT4 sidesteps this and is structurally a better fit since RDNA 3.5 has no native FP8 anyway.
-
-### 🚨 vLLM v0.20.0 qwen3 reasoning parser DOES NOT STREAM REASONING on `/v1/chat/completions`
-
-Confirmed bug  -  independent of DFlash, present even without spec decode. With `--reasoning-parser qwen3` enabled and `stream: true`:
-
-- **`/v1/chat/completions`**: parser **buffers** all `<think>...</think>` content server-side, emits **zero** `delta.reasoning_content` chunks during the stream. Client sees a long "ttft" silence (~10-30 s of thinking) and then a burst of the post-thinking answer at the end.
-- **`/v1/responses`**: streams correctly  -  `response.reasoning_text.delta` events arrive at t+0.33 s, then `response.output_text.delta` after `</think>`. Same engine, same DFlash, same numbers. Different code path that actually works.
-
-Verified via direct curl probe in this repo (`stream:true`, simple math prompt):
-
-| Endpoint | `reasoning` deltas during stream | First delta arrives |
-|---|---|---|
-| `/v1/chat/completions` | **0** | t+12.52 s (just the post-think answer) |
-| `/v1/responses` | **62** | **t+0.33 s** ✅ |
-
-**Workaround for end-user clients that need streaming reasoning visible:**
-- **Use `/v1/responses`**  -  fully working today, recommended.
-- Alternatively disable the parser (remove `--reasoning-parser qwen3` from `docker-compose.yml`) and let raw `<think>...</think>` text stream as part of `delta.content`. Tradeoff: `/v1/responses` no longer auto-separates reasoning into structured `output[].type == "reasoning"` items.
-- Or accept it: send `stream: false` on chat completions when you need to display reasoning.
-
-The included `.tools/qwen-cli.py` uses `/v1/responses` to dodge the bug.
-
-This is worth filing upstream  -  the qwen3 parser's streaming path appears to never call `extract_reasoning_content_streaming` correctly on the chat-completions code path. Affects every model using `--reasoning-parser qwen3`, not just DFlash workloads.
-
-> **Transparency note**: this is the issue we hit and verified. There are almost certainly **other** vLLM v0.20.0 quirks we did not exercise  -  long-context corner cases, edge sampler params, multimodal + tools combinations, prefix-cache edge cases, etc. We only documented what our bench surfaced. If you run a workload mode we didn't test (different drafter, different attention backend, hybrid grad cudagraph, etc.) and hit something weird, the right move is *not* "the repo is broken" but "vLLM v0.20.0 is early on this code path  -  check upstream issues, file if new". DFlash + reasoning-parser + ROCm-on-RDNA3.5 are all simultaneously in active flux upstream as of 2026-04-26.
-
-### 🚨 DFlash speculative decoding is *early upstream  -  fragile path*
-
-DFlash landed in vLLM main on **2026-03-30** ([PR #36847](https://github.com/vllm-project/vllm/pull/36847)). As of the time of this README, **5+ DFlash bug-fix PRs are still open** and several DFlash-class bug reports are unresolved across multiple GPU vendors (NVIDIA, AMD, both):
-
-| Open issue / PR | Title | Vendor | Why it matters here |
-|---|---|---|---|
-| [#39928](https://github.com/vllm-project/vllm/issues/39928) | Qwen3.5 DFlash gives strange responses on SM90 | NVIDIA H100 | Confirms DFlash output-quality bugs are not unique to AMD |
-| [#40624](https://github.com/vllm-project/vllm/issues/40624) | Gemma4 0% prefix cache hits with hybrid attention + DFlash | All | Hybrid (DeltaNet-style) attention + DFlash interaction is the same class as our Qwen 3.6-27B target |
-| [#40382](https://github.com/vllm-project/vllm/issues/40382) | Gemma-4 + DFlash unservable on Ampere  -  non-causal + head_dim=256 has no compatible attention backend | NVIDIA A100 | DFlash needs `supports_non_causal=True` backends; not all backends qualify (this is exactly what our Patch 13 fixes for `ROCM_ATTN`) |
-| [#40425](https://github.com/vllm-project/vllm/pull/40425) | Fix quantized DFlash Qwen3 draft support | All | Open PR fixing quantized drafter loading |
-| [#40334](https://github.com/vllm-project/vllm/pull/40334) | fix(dflash): dtype mismatch in `combine_hidden_states` | All | Open PR fixing a dtype bug in the auxiliary-hidden-state path |
-| [#40727](https://github.com/vllm-project/vllm/pull/40727) | Update dflash aux layer indexing | All | Related to the same `+1` shift bug our Patch 14d (PR #40898) addresses |
-| [#40632](https://github.com/vllm-project/vllm/issues/40632) | Support DFlash for Kimi K2.5 and Qwen3.5-27B for AMD | AMD | The umbrella issue for AMD-side DFlash support  -  our work plugs into this |
-
-**Bottom line: DFlash is not "stable upstream" yet on any vendor.** It works for our specific Qwen 3.6-27B + AWQ4 + N=8 path because we've patched around the issues we hit, but you may encounter unfixed-upstream behaviors not seen here, especially with different drafters, different N values, or different attention backends.
-
-If output quality looks off (incoherent, repetitive, garbled), **first try `--speculative-config '{"method":"dflash", ..., "num_speculative_tokens":1}'`**  -  that's the safest setting; it isolates whether the issue is DFlash itself vs the multi-token spec-decode path.
-
-<details>
-<summary><b>Stuck DFlash worker on client disconnect  -  what we hit during the long-context test (recovery documented)</b></summary>
-
-**Symptom (we hit it once during ~22K-token long-context decode):** if the client TCP-disconnects mid-decode while `--speculative-config method=dflash` is active, the EngineCore worker may not gracefully unwind. The API server (`/health`, `/v1/models`) stays responsive but new `/v1/chat/completions` requests time out forever. EngineCore burns 79-200% CPU in a tight loop. Kernel logs:
-
-```
-workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 5 times,
-consider switching to WQ_UNBOUND
-```
-
-**Likely cause:** a refcount / cancel race between the DFlash proposer thread and the KFD GPU buffer release path when a request is cancelled mid-decode. The DFlash worker keeps running while the client cancellation tries (and fails) to reclaim its buffers. Plausibly related to the open issues table above  -  DFlash's cancellation/cleanup path is not yet hardened upstream.
-
-**Recovery:** `docker compose restart vllm-awq4-qwen` (≈ 9 min cold boot). Run `./scripts/dump_logs.sh stuck-state` *before* the restart to preserve diagnostics for an upstream report.
-
-**Mitigation while waiting for upstream fix:**
-- Prefer client-side timeouts larger than your expected decode time
-- Avoid `SIGKILL`'ing the client mid-stream  -  use `SIGINT` or wait for graceful completion
-- For very long-context requests (>10K prompt tokens), consider testing with `num_speculative_tokens=1` first to confirm baseline correctness, then ramp up
-
-If you reproduce this, file under the [DFlash umbrella tracker (#40632)](https://github.com/vllm-project/vllm/issues/40632) with output of `./scripts/dump_logs.sh`.
-
-</details>
-
----
 
 ## 🥨 Sibling repos (same hardware, different quants)
 
@@ -464,14 +381,146 @@ Each script is self-contained and prints to stdout. Engine must already be runni
 
 ## 🙏 Credits
 
-- [@micah-wil](https://github.com/micah-wil) (AMD)  -  PR #40176, the actual fix that lights up DFlash on RDNA 3.5
-- [@jianc99](https://github.com/jianc99) (z-lab)  -  DFlash paper, drafter model, PR #40898
-- [@kyuz0](https://github.com/kyuz0) (Donato Capitella, Reversec)  -  the Strix Halo + vLLM patch bundle that hardware-enables gfx1151
-- [@hongxiayang](https://github.com/hongxiayang) (AMD)  -  MI3xx DFlash verification, vLLM issue #40632 stewardship
-- [@cyankiwi](https://huggingface.co/cyankiwi)  -  the AWQ-INT4 quant we serve as target
+- [@micah-wil](https://github.com/micah-wil) (AMD) - PR #40176, the actual fix that lights up DFlash on RDNA 3.5
+- [@jianc99](https://github.com/jianc99) (z-lab) - DFlash paper, drafter model, PR #40898
+- [@kyuz0](https://github.com/kyuz0) (Donato Capitella, Reversec) - the Strix Halo + vLLM patch bundle that hardware-enables gfx1151
+- [@hongxiayang](https://github.com/hongxiayang) (AMD) - MI3xx DFlash verification, vLLM issue #40632 stewardship
+- [@cyankiwi](https://huggingface.co/cyankiwi) - the AWQ-INT4 quant we serve as target
+
+---
+
+## ⚠️ Honest limitations
+
+- **Single-stream only configured** (`--max-num-seqs 1`). Open it to 4-10 for aggregate throughput.
+- **Drafter is gated** on HuggingFace - manual approval required, no ungated mirror.
+- **Streaming tool calls have known upstream bugs** (vLLM PRs #40785, #40787 closed unmerged). Use non-streaming.
+- **Triton JIT cold-start ≈ 8-10 min.** Persisted to `./.triton-cache`, warm restarts < 30 s.
+- **DFlash acceptance drops past N≈8** (drafter less accurate further ahead). N=15 may give marginal further gain; we stopped at N=8 (best steady-state on chat is 19.8 t/s, on `/v1/responses` is 24.8).
+- **Numbers in this README are wall-clock client-side.** vLLM internal generation throughput is ≈ 25-27 t/s on these workloads (engine excludes round-trip + initial prefill).
+- **HIP graphs freeze on gfx1151** - `--enforce-eager` mandatory.
+- **Official `Qwen/Qwen3.6-27B-FP8` doesn't init** on RDNA 3.5 (Triton w8a8 autotune stall on the hybrid model's DeltaNet partitions). AWQ-INT4 sidesteps this and is structurally a better fit since RDNA 3.5 has no native FP8 anyway.
+
+### 🚨 vLLM v0.20.0 qwen3 reasoning parser DOES NOT STREAM REASONING on `/v1/chat/completions`
+
+Confirmed bug - independent of DFlash, present even without spec decode. With `--reasoning-parser qwen3` enabled and `stream: true`:
+
+- **`/v1/chat/completions`**: parser **buffers** all `<think>...</think>` content server-side, emits **zero** `delta.reasoning_content` chunks during the stream. Client sees a long "ttft" silence (~10-30 s of thinking) and then a burst of the post-thinking answer at the end.
+- **`/v1/responses`**: streams correctly - `response.reasoning_text.delta` events arrive at t+0.33 s, then `response.output_text.delta` after `</think>`. Same engine, same DFlash, same numbers. Different code path that actually works.
+
+Verified via direct curl probe in this repo (`stream:true`, simple math prompt):
+
+| Endpoint | `reasoning` deltas during stream | First delta arrives |
+|---|---|---|
+| `/v1/chat/completions` | **0** | t+12.52 s (just the post-think answer) |
+| `/v1/responses` | **62** | **t+0.33 s** ✅ |
+
+**Workaround for end-user clients that need streaming reasoning visible:**
+- **Use `/v1/responses`** - fully working today, recommended.
+- Alternatively disable the parser (remove `--reasoning-parser qwen3` from `docker-compose.yml`) and let raw `<think>...</think>` text stream as part of `delta.content`. Tradeoff: `/v1/responses` no longer auto-separates reasoning into structured `output[].type == "reasoning"` items.
+- Or accept it: send `stream: false` on chat completions when you need to display reasoning.
+
+The included `glados.py` uses `/v1/responses` to dodge the bug.
+
+This is worth filing upstream - the qwen3 parser's streaming path appears to never call `extract_reasoning_content_streaming` correctly on the chat-completions code path. Affects every model using `--reasoning-parser qwen3`, not just DFlash workloads.
+
+> **Transparency note**: this is the issue we hit and verified. There are almost certainly **other** vLLM v0.20.0 quirks we did not exercise - long-context corner cases, edge sampler params, multimodal + tools combinations, prefix-cache edge cases, etc. We only documented what our bench surfaced. If you run a workload mode we didn't test (different drafter, different attention backend, hybrid grad cudagraph, etc.) and hit something weird, the right move is *not* "the repo is broken" but "vLLM v0.20.0 is early on this code path - check upstream issues, file if new". DFlash + reasoning-parser + ROCm-on-RDNA3.5 are all simultaneously in active flux upstream as of 2026-04-26.
+
+### 🚨 DFlash speculative decoding is *early upstream - fragile path*
+
+DFlash landed in vLLM main on **2026-03-30** ([PR #36847](https://github.com/vllm-project/vllm/pull/36847)). As of the time of this README, **5+ DFlash bug-fix PRs are still open** and several DFlash-class bug reports are unresolved across multiple GPU vendors (NVIDIA, AMD, both):
+
+| Open issue / PR | Title | Vendor | Why it matters here |
+|---|---|---|---|
+| [#39928](https://github.com/vllm-project/vllm/issues/39928) | Qwen3.5 DFlash gives strange responses on SM90 | NVIDIA H100 | Confirms DFlash output-quality bugs are not unique to AMD |
+| [#40624](https://github.com/vllm-project/vllm/issues/40624) | Gemma4 0% prefix cache hits with hybrid attention + DFlash | All | Hybrid (DeltaNet-style) attention + DFlash interaction is the same class as our Qwen 3.6-27B target |
+| [#40382](https://github.com/vllm-project/vllm/issues/40382) | Gemma-4 + DFlash unservable on Ampere - non-causal + head_dim=256 has no compatible attention backend | NVIDIA A100 | DFlash needs `supports_non_causal=True` backends; not all backends qualify (this is exactly what our Patch 13 fixes for `ROCM_ATTN`) |
+| [#40425](https://github.com/vllm-project/vllm/pull/40425) | Fix quantized DFlash Qwen3 draft support | All | Open PR fixing quantized drafter loading |
+| [#40334](https://github.com/vllm-project/vllm/pull/40334) | fix(dflash): dtype mismatch in `combine_hidden_states` | All | Open PR fixing a dtype bug in the auxiliary-hidden-state path |
+| [#40727](https://github.com/vllm-project/vllm/pull/40727) | Update dflash aux layer indexing | All | Related to the same `+1` shift bug our Patch 14d (PR #40898) addresses |
+| [#40632](https://github.com/vllm-project/vllm/issues/40632) | Support DFlash for Kimi K2.5 and Qwen3.5-27B for AMD | AMD | The umbrella issue for AMD-side DFlash support - our work plugs into this |
+
+**Bottom line: DFlash is not "stable upstream" yet on any vendor.** It works for our specific Qwen 3.6-27B + AWQ4 + N=8 path because we've patched around the issues we hit, but you may encounter unfixed-upstream behaviors not seen here, especially with different drafters, different N values, or different attention backends.
+
+If output quality looks off (incoherent, repetitive, garbled), **first try `--speculative-config '{"method":"dflash", ..., "num_speculative_tokens":1}'`** - that's the safest setting; it isolates whether the issue is DFlash itself vs the multi-token spec-decode path.
+
+<details>
+<summary><b>Stuck DFlash worker on client disconnect - what we hit during the long-context test (recovery documented)</b></summary>
+
+**Symptom (we hit it once during ~22K-token long-context decode):** if the client TCP-disconnects mid-decode while `--speculative-config method=dflash` is active, the EngineCore worker may not gracefully unwind. The API server (`/health`, `/v1/models`) stays responsive but new `/v1/chat/completions` requests time out forever. EngineCore burns 79-200% CPU in a tight loop. Kernel logs:
+
+```
+workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 5 times,
+consider switching to WQ_UNBOUND
+```
+
+**Likely cause:** a refcount / cancel race between the DFlash proposer thread and the KFD GPU buffer release path when a request is cancelled mid-decode. The DFlash worker keeps running while the client cancellation tries (and fails) to reclaim its buffers. Plausibly related to the open issues table above - DFlash's cancellation/cleanup path is not yet hardened upstream.
+
+**Recovery:** `docker compose restart vllm-awq4-qwen` (≈ 9 min cold boot). Run `./scripts/dump_logs.sh stuck-state` *before* the restart to preserve diagnostics for an upstream report.
+
+**Mitigation while waiting for upstream fix:**
+- Prefer client-side timeouts larger than your expected decode time
+- Avoid `SIGKILL`'ing the client mid-stream - use `SIGINT` or wait for graceful completion
+- For very long-context requests (>10K prompt tokens), consider testing with `num_speculative_tokens=1` first to confirm baseline correctness, then ramp up
+
+If you reproduce this, file under the [DFlash umbrella tracker (#40632)](https://github.com/vllm-project/vllm/issues/40632) with output of `./scripts/dump_logs.sh`.
+
+</details>
+
+---
+
+<details>
+<summary><b>hidden</b></summary>
+
+```
+                  .,-:;//;:=,
+              . :H@@@MM@M#H/.,+%;,
+           ,/X+ +M@@M@MM%=,-%HMMM@X/,
+         -+@MM; $M@@MH+-,;XMMMM@MMMM@+-
+        ;@M@@M- XM@X;. -+XXXXXHHH@M@M#@/.
+      ,%MM@@MH ,@%=             .---=-=:=,.
+      =@#@@@MX.,                -%HX$$%%%:;
+     =-./@M@M$                   .;@MMMM@MM:
+     X@/ -$MM/                    . +MM@@@M$
+    ,@M@H: :@:                    . =X#@@@@-
+    ,@@@MMX, .                    /H- ;@M@M=
+    .H@@@@M@+,                    %MM+..%#$.
+     /MMMM@MMH/.                  XM@MH; =;
+      /%+%$XHH@$=              , .H@@@@MX,
+       .=--------.           -%H.,@@@@@MX,
+       .%MM@@@HHHXX$$$%+- .:$MMX =M@@MM%.
+         =XMMM@MM@MM#H;,-+HMM@M+ /MMMX=
+           =%@M@M#@$-.=$@MM@@@M; %M%=
+             ,:+$+-,/H#MMMMMMM@= =,
+                  =++%%%%+/:-.
+```
+
+> **APERTURE SCIENCE COMPUTER-AIDED ENRICHMENT CENTER**
+>
+> *Welcome to GLaDOS, powered by Qwen 3.6-27B (AWQ-INT4) + DFlash on AMD Strix Halo.*
+
+🟧 **You found the secret CLI.** Once your engine is running:
+
+```bash
+docker compose up -d
+# wait for: "Application startup complete" in `docker logs -f vllm-awq4-qwen`
+
+./glados.py                       # interactive REPL with Aperture banner + a random GLaDOS quote
+./glados.py "explain mitosis"     # one-shot
+./glados.py --bench               # 5-prompt benchmark
+```
+
+In the REPL: type your prompt and hit Enter. Streams `<thinking>...</thinking>` live (via the `/v1/responses` path that actually works), then the answer, then a one-line stats summary: `prompt→output tokens · wall time · wall t/s · vLLM ground-truth t/s · DFlash acceptance %`.
+
+To leave: `exit`, `quit`, `:q`, or `Ctrl-D`. To abort an in-flight generation without leaving: `Ctrl-C`.
+
+The banner shows in **Aperture orange** in your terminal (markdown above can't render true color, but `glados.py` uses ANSI 208 in the actual TTY).
+
+*Thank you for participating in this Aperture Science computer-aided enrichment activity.*
+
+</details>
 
 ---
 
 ## 📜 License
 
-[The Unlicense](LICENSE)  -  public domain. Use, modify, distribute, sell, fork. No attribution required, no warranty given.
+[The Unlicense](LICENSE) - public domain. Use, modify, distribute, sell, fork. No attribution required, no warranty given.

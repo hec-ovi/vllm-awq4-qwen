@@ -1,0 +1,55 @@
+# Secrets  -  only .env.template is committed
+.env
+.env.local
+*.key
+*.pem
+
+# Research data (deep-research findings, may contain proprietary insight)
+.research/
+
+# Local working tree (cloned reference repos, scratch space)
+tmp/
+logs/
+
+# Session history preserved locally but not shipped
+.tests/
+
+# Local helpers (qwen-cli, repo metadata)  -  kept hidden, not shipped
+.tools/
+
+# Benchmark output (regenerated each run)
+test/*.json
+test/results/
+
+# JIT caches (regenerated each run, large)
+.triton-cache/
+.vllm-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs / tmp
+*.log
+*.tmp
+
+# Model weights should never be in the repo
+*.safetensors
+*.gguf
+*.bin
+models/

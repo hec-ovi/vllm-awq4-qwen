@@ -1,0 +1,124 @@
+services:
+  vllm:
+    image: vllm-awq4-qwen:builder
+    build:
+      context: .
+      args:
+        VLLM_COMMIT: ${VLLM_COMMIT:-v0.20.0}
+    container_name: vllm-awq4-qwen
+    # Manual control only. NEVER auto-restart on host reboot  -  this rig
+    # is the user's daily-driver PC; if it crashes during a kernel test
+    # we want it to stay down so the user can inspect logs from a phone.
+    restart: "no"
+    privileged: true
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    ports:
+      - "127.0.0.1:${VLLM_HOST_PORT:-8000}:8000"
+    volumes:
+      # Host-mounted model cache. Must contain the HuggingFace hub/ subdir
+      # with cyankiwi/Qwen3.6-27B-AWQ-INT4 snapshot fetched via:
+      #   hf download cyankiwi/Qwen3.6-27B-AWQ-INT4 --cache-dir $VLLM_HOST_MODELS_DIR/hub
+      - ${VLLM_HOST_MODELS_DIR}:/models:ro
+      # Persist Triton JIT cache across restarts.
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache}:/root/.triton/cache
+      - ${VLLM_HOST_VLLM_CACHE:-./.vllm-cache}:/root/.cache/vllm
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      HIP_VISIBLE_DEVICES: "0"
+      # Disable AITER's CDNA-only kernels (FP8 linear, fused MoE,
+      # RMSNorm)  -  documented freeze classes on gfx1151. The Strix
+      # patch bundle also fences these at the Python layer.
+      VLLM_ROCM_USE_AITER: "0"
+      # Force Triton AWQ kernel path (compressed-tensors -> AWQMarlin
+      # -> Conch). On the AWQMarlin-on-ROCm refactor (PR #36505) this
+      # delivered +57% prefill / +73% decode for AWQ on gfx1151.
+      VLLM_USE_TRITON_AWQ: "1"
+      # Avoid the EngineCore pickling regression that surfaces on
+      # cold-start with the v0.20.0 compile-cache pipeline.
+      VLLM_DISABLE_COMPILE_CACHE: "1"
+      # Avoid HSA scratch-reclaim segfault during AWQ tensor
+      # materialization (vllm#37151 still open as of 2026-04-26).
+      HSA_NO_SCRATCH_RECLAIM: "1"
+      # MIOpen has no precompiled solver DB for gfx1151. Fast-find avoids
+      # exhaustive-search hangs on ViT conv stems (vllm#37472).
+      MIOPEN_FIND_MODE: FAST
+      # NEVER set VLLM_LOGGING_LEVEL=DEBUG. vLLM's ir/op.py formats
+      # tensor arguments as strings at every op dispatch when DEBUG is
+      # on, which makes decode 20-100x slower (millions of Python
+      # iterations per forward pass).
+    command:
+      - vllm
+      - serve
+      - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-27B-AWQ-INT4}
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL_NAME:-Qwen3.6-27B-AWQ4}
+      # Do NOT pass --quantization. vLLM auto-detects compressed-tensors
+      # from config.json and routes through AWQMarlinLinearMethod ->
+      # ConchLinearKernel. Passing the flag explicitly risks falling
+      # back to the legacy ops.awq_gemm slow path.
+      #
+      # Attention backends (load-bearing on gfx1151):
+      #   LM:  ROCM_ATTN selected for DFlash speculative decoding. Our
+      #        Patch 13 cherry-picks vLLM PR #40176 which adds
+      #        supports_non_causal()=True + causal:bool field to this
+      #        backend (NOT in v0.20.0 tag, only on main as of 04-22).
+      #        Historical note: TRITON_ATTN beat ROCM_ATTN by 2x at long
+      #        context BEFORE PR #40176, but TRITON_ATTN doesn't expose
+      #        non-causal so it cannot host DFlash. Re-bench after
+      #        spec-decode is stable to validate the tradeoff.
+      #   ViT: TRITON_ATTN required  -  auto-pick falls to TORCH_SDPA
+      #        which silently produces NaN/Inf and collapses output to
+      #        endless "!" stream on image input (kyuz0 PR #47).
+      - --attention-backend
+      - ROCM_ATTN
+      - --mm-encoder-attn-backend
+      - TRITON_ATTN
+      # Qwen3.x emits <think>...</think> tokens in native thinking mode.
+      # The qwen3 reasoning parser separates reasoning from visible
+      # content for /v1/responses.
+      - --reasoning-parser
+      - qwen3
+      # Tool-call parser. qwen3_coder is the recommended parser for
+      # Qwen3.5/3.6 in vLLM 0.20+. Three upstream parser PRs
+      # (#40783, #40785, #40787) addressing streaming bugs are NOT yet
+      # merged (#40785/#40787 closed unmerged on 2026-04-25). Tool calls
+      # in non-streaming mode work; streaming may drop final newlines or
+      # fragment tags. For agentic loops, prefer non-streaming until the
+      # parser PRs land.
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-auto-tool-choice
+      # HIP Graph capture is a documented freeze class on gfx1151.
+      # Keep --enforce-eager ON until upstream confirms otherwise.
+      - --enforce-eager
+      # Reserve headroom for the Triton autotuner  -  DeltaNet GDN
+      # kernels (solve_tril, chunk_scaled_dot_kkt,
+      # chunk_gated_delta_rule_fwd) autotune on the FIRST real request,
+      # not during profile_run. Leaving 10% UMA free prevents OOM.
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTIL:-0.9}"
+      - --max-num-seqs
+      - "${VLLM_MAX_NUM_SEQS:-1}"
+      # Native max context for Qwen 3.6 27B is 262144 (256K). AWQ4
+      # frees ~37 GiB of UMA vs BF16, full 256K is comfortable.
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-262144}"
+      # DFlash speculative decoding (PR #36847 NVIDIA base + PR #40176 ROCm
+      # non-causal attn + PR #40898 SWA support; the latter two are local
+      # cherry-picks via patch_strix.py Patches 13 and 14).
+      # Drafter: z-lab/Qwen3.6-27B-DFlash (~2B BF16, gated on HF), block_size=16.
+      # Start at N=1 for boot correctness; scale to 4 then 8 once verified.
+      # The drafter has interleaved SWA layers (4 sliding + 1 full), which is
+      # why PR #40898 is required (target_layer_ids +1 fix + per-layer SWA
+      # attn metadata). Acceptance length without #40898 is ~25% lower.
+      - --speculative-config
+      - '{"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":${VLLM_DFLASH_N:-8}}'

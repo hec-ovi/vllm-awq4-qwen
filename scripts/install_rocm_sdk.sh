@@ -10,16 +10,18 @@ echo "=== Installing TheRock ROCm SDK ($GFX, major version $ROCM_MAJOR_VER) ==="
 
 cd /tmp
 
-BASE="https://therock-nightly-tarball.s3.amazonaws.com"
+BASE="https://rocm.nightlies.amd.com/tarball"
 PREFIX="therock-dist-linux-${GFX}-${ROCM_MAJOR_VER}"
 
-# Resolve latest tarball key from S3 bucket listing. Sort -V picks the
-# highest semver-ish suffix, which on TheRock's bucket is the most
-# recent nightly date stamp (e.g. 7.13.0a20260424).
-KEY="$(curl -s "${BASE}?list-type=2&prefix=${PREFIX}" \
-  | tr '<' '\n' \
-  | grep -o "therock-dist-linux-${GFX}-${ROCM_MAJOR_VER}\..*\.tar\.gz" \
-  | sort -V | tail -n1)"
+# Resolve latest tarball key from the rocm.nightlies HTML index. Sort -V
+# picks the highest semver-ish suffix, which is the most recent nightly
+# date stamp (e.g. 7.13.0a20260426). This mirror is consistently 10-20x
+# faster from EU/non-US-East-2 routes than the S3 bucket origin
+# (therock-nightly-tarball.s3.amazonaws.com), which is the bucket
+# rocm.nightlies fronts.
+KEY="$(curl -s "${BASE}/" \
+  | grep -oE "therock-dist-linux-${GFX}-${ROCM_MAJOR_VER}\.[^\"<]*\.tar\.gz" \
+  | sort -V | uniq | tail -n1)"
 
 if [ -z "$KEY" ]; then
   echo "ERROR: no tarball matching ${PREFIX} found at ${BASE}" >&2

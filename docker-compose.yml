@@ -15,7 +15,12 @@ services:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
     ports:
-      - "127.0.0.1:${VLLM_HOST_PORT:-8000}:8000"
+      # Bind to all host interfaces so containers in other docker networks
+      # can reach vLLM via host.docker.internal / the docker bridge gateway.
+      # Loopback-only ("127.0.0.1:8000:8000") blocks cross-container traffic
+      # because the kernel won't deliver bridge-arriving packets to a
+      # loopback-bound port. See: external API container needs vLLM access.
+      - "${VLLM_HOST_PORT:-8000}:8000"
     volumes:
       # Host-mounted model cache. Must contain the HuggingFace hub/ subdir
       # with cyankiwi/Qwen3.6-27B-AWQ-INT4 snapshot fetched via:

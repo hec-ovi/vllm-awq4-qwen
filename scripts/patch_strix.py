@@ -1083,6 +1083,64 @@ except Exception:
             p_gmr.write_text(txt)
             print(" -> Patched vllm/v1/worker/gpu_model_runner.py (PR #40898: target_layer_ids +1 shift fix for dflash)")
 
+    # Patch 15 (local): thread chat_template_kwargs through /v1/responses.
+    #
+    # Without this, ResponsesRequest.to_chat_params() builds chat_template_kwargs
+    # from a hardcoded dict and never reads the request body's
+    # chat_template_kwargs field. Effect on Qwen3.6: clients that send
+    # `chat_template_kwargs: {"enable_thinking": false}` get reasoning anyway,
+    # while the same kwarg works on /v1/chat/completions (different code path).
+    # The chat template ITSELF supports enable_thinking - this gap is purely
+    # in vLLM's request-to-template wiring on the responses endpoint.
+    #
+    # Fix is two changes:
+    #   15a: add a chat_template_kwargs field to the ResponsesRequest model
+    #   15b: pass it as `defaults` to merge_kwargs() so user-supplied kwargs
+    #        live alongside vLLM's hardcoded add_generation_prompt etc.
+    #        (vLLM's overrides still win for keys it controls).
+    #
+    # Worth filing upstream as a vLLM PR; the gap looks accidental.
+    p_responses_proto = Path('vllm/entrypoints/openai/responses/protocol.py')
+    if p_responses_proto.exists():
+        txt = p_responses_proto.read_text()
+
+        # 15a: add chat_template_kwargs field, sandwiched between `user` (last
+        # OpenAI-spec field) and `skip_special_tokens` (first vLLM extension).
+        field_anchor = "    user: str | None = None\n    skip_special_tokens: bool = True\n"
+        field_replacement = (
+            "    user: str | None = None\n"
+            "    chat_template_kwargs: dict[str, Any] | None = None\n"
+            "    skip_special_tokens: bool = True\n"
+        )
+        if "chat_template_kwargs: dict[str, Any] | None = None" not in txt and field_anchor in txt:
+            txt = txt.replace(field_anchor, field_replacement, 1)
+            print(" -> Patched protocol.py (15a: ResponsesRequest gains chat_template_kwargs field)")
+
+        # 15b: in to_chat_params(), feed the user kwargs into merge_kwargs as
+        # the `defaults` argument. The hardcoded dict stays as `overrides` so
+        # vLLM-managed keys (add_generation_prompt, continue_final_message,
+        # reasoning_effort) keep precedence, while user-supplied keys
+        # (enable_thinking, etc.) flow through to the chat template renderer.
+        # Indents: the call sits inside `return ChatParams(` so it's 12 spaces
+        # for the kwarg line and 16 spaces for the inner positional args.
+        merge_anchor = (
+            "            chat_template_kwargs=merge_kwargs(  # To remove unset values\n"
+            "                {},\n"
+            "                dict(\n"
+            "                    add_generation_prompt=not continue_final,\n"
+        )
+        merge_replacement = (
+            "            chat_template_kwargs=merge_kwargs(  # To remove unset values\n"
+            "                self.chat_template_kwargs or {},\n"
+            "                dict(\n"
+            "                    add_generation_prompt=not continue_final,\n"
+        )
+        if "self.chat_template_kwargs or {}" not in txt and merge_anchor in txt:
+            txt = txt.replace(merge_anchor, merge_replacement, 1)
+            print(" -> Patched protocol.py (15b: to_chat_params merges user chat_template_kwargs)")
+
+        p_responses_proto.write_text(txt)
+
     print("Successfully patched vLLM/Environment for Strix Halo.")
 
 if __name__ == "__main__":

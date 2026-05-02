@@ -33,6 +33,20 @@ __pycache__/
 .venv/
 venv/
 
+# C/HIP custom-op build artifacts (rebuilt on demand inside the container)
+csrc/**/build/
+csrc/**/*.so
+# hipify auto-generates *_hip.{hip,cpp,h} alongside the originals; only commit the originals
+csrc/**/*_hip.hip
+csrc/**/*_hip.cpp
+csrc/**/*_hip.h
+
+# Scratch session notes
+session.txt
+
+# Claude Code local config / scheduled-task state (per-project, not shared)
+.claude/
+
 # Editors / IDE
 .vscode/
 .idea/

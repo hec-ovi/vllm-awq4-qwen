@@ -29,6 +29,11 @@ services:
       # Persist Triton JIT cache across restarts.
       - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache}:/root/.triton/cache
       - ${VLLM_HOST_VLLM_CACHE:-./.vllm-cache}:/root/.cache/vllm
+      # Live-mount HIP custom-op source for the in-flight MMQ Q4 port.
+      # Edits on the host are immediately visible inside the container, so
+      # `python setup.py build_ext --inplace` picks them up without docker cp.
+      # See .research/mmq-q4-gfx1151-port/FINDINGS.md for the dev loop.
+      - ./csrc:/root/csrc:rw
     ipc: host
     shm_size: "16gb"
     environment:
@@ -113,6 +118,12 @@ services:
       - "${VLLM_GPU_MEMORY_UTIL:-0.9}"
       - --max-num-seqs
       - "${VLLM_MAX_NUM_SEQS:-1}"
+      # Token budget per scheduler iteration. Default in vLLM v0.20.0 is 8192
+      # for online serving. Bumping to 16384 lets long prefills land in fewer
+      # chunks and lets a chunk fully use the matmul kernels. Tradeoff: more
+      # KV pressure when batching many concurrent decodes.
+      - --max-num-batched-tokens
+      - "${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
       # Native max context for Qwen 3.6 27B is 262144 (256K). AWQ4
       # frees ~37 GiB of UMA vs BF16, full 256K is comfortable.
       - --max-model-len

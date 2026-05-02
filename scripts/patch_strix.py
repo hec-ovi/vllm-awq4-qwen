@@ -1141,6 +1141,46 @@ except Exception:
 
         p_responses_proto.write_text(txt)
 
+    # Patch 16 (local): register the AWQ-INT4 MMQ HIP custom op into vLLM's
+    # mixed-precision kernel dispatcher so it's picked ahead of TritonW4A16
+    # for the W4A16 g32 path on gfx1151. The .so is built from
+    # /workspace/csrc/awq_mmq_gfx1151/ (host-mounted at /root/csrc/) and
+    # imports lazily at module-load time.
+    #
+    # Implementation: append a registration block to the dispatcher's
+    # __init__.py. On load the block adds the package dir to sys.path,
+    # imports our RocmMmqQ4LinearKernel, and inserts it at position 0 of
+    # _POSSIBLE_KERNELS[ROCM]. If the import fails (e.g. .so not built yet),
+    # the kernel list is left untouched and TritonW4A16 keeps its slot.
+    #
+    # apply_weights internally dispatches: M >= 32 (prefill) -> our HIP
+    # kernel, M < 32 (decode) -> TritonW4A16 fallback. Both paths use the
+    # same layer's weight tensors via the dual-storage process_weights step.
+    # See .research/mmq-q4-gfx1151-port/FINDINGS.md.
+    p_dispatch = Path('vllm/model_executor/kernels/linear/__init__.py')
+    if p_dispatch.exists():
+        txt = p_dispatch.read_text()
+        if "Patch 16" not in txt:
+            injection = (
+                "\n\n# --- Patch 16: AWQ-INT4 MMQ HIP custom op for gfx1151 (Strix Halo) ---\n"
+                "import sys as _sys\n"
+                "import os as _os\n"
+                "_AWQ_MMQ_DIR = '/root/csrc/awq_mmq_gfx1151'\n"
+                "if _os.path.exists(_AWQ_MMQ_DIR) and _AWQ_MMQ_DIR not in _sys.path:\n"
+                "    _sys.path.insert(0, _AWQ_MMQ_DIR)\n"
+                "try:\n"
+                "    from awq_mmq_gfx1151.vllm_kernel import RocmMmqQ4LinearKernel as _RocmMmqQ4\n"
+                "    if _RocmMmqQ4 not in _POSSIBLE_KERNELS.get(PlatformEnum.ROCM, []):\n"
+                "        _POSSIBLE_KERNELS[PlatformEnum.ROCM].insert(0, _RocmMmqQ4)\n"
+                "        logger.info('Patch 16: RocmMmqQ4LinearKernel registered at _POSSIBLE_KERNELS[ROCM][0]')\n"
+                "except Exception as _e:\n"
+                "    logger.warning('Patch 16: failed to register RocmMmqQ4LinearKernel: %s', _e)\n"
+                "# --- end Patch 16 ---\n"
+            )
+            txt += injection
+            p_dispatch.write_text(txt)
+            print(" -> Patched vllm/model_executor/kernels/linear/__init__.py (Patch 16: AWQ-INT4 MMQ HIP)")
+
     print("Successfully patched vLLM/Environment for Strix Halo.")
 
 if __name__ == "__main__":

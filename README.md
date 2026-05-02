@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Status-Working-brightgreen" alt="Status" />
   <img src="https://img.shields.io/badge/Single--stream-24.8_t%2Fs_peak-red" alt="Speed" />
   <img src="https://img.shields.io/badge/3--stream_aggregate-41_t%2Fs_peak-red" alt="3-stream aggregate" />
-  <img src="https://img.shields.io/badge/Prefill-33--400_t%2Fs-orange" alt="Prefill" />
+  <img src="https://img.shields.io/badge/Prefill-105--134_t%2Fs_(0--32K,_HIP_kernel)-brightgreen" alt="Prefill" />
   <img src="https://img.shields.io/badge/Model-Qwen3.6--27B--AWQ4-0b7285" alt="Model" />
   <img src="https://img.shields.io/badge/Quant-AWQ_INT4_W4A16_g32-purple" alt="Quant" />
   <img src="https://img.shields.io/badge/Context-256K_native-orange" alt="Context" />
@@ -43,16 +43,40 @@
 
 ### 📈 Prefill (input processing) speed
 
-Decode speed is what most people measure. How fast the engine ingests the prompt before the first token streams, from `/metrics`:
+Prefill is now **flat at 105 to 134 t/s from 0 to 32K context** thanks to a custom HIP kernel that ships with this repo (`csrc/awq_mmq_gfx1151/`, registered into vLLM by [Patch 16](#-what-we-contributed)). Before the kernel, prefill was a steep cliff curve on TritonW4A16 (132 t/s @ 1k -> 77 t/s @ 2k -> 38 t/s @ 4k). The kernel is a **3.4x improvement at the 4k pain point** and roughly **2.8x at 32k**, while leaving decode bit-for-bit identical (the kernel only takes over for M >= 32; decode shapes still route through TritonW4A16 via the M-dispatch in `vllm_kernel.py`).
 
-| Metric | Value | Notes |
-|---|---|---|
-| Per-request prefill avg | **33-38 t/s** | realistic, includes prompt-with-tools, under reasoning + concurrency contention |
-| Instantaneous prefill peaks | **100-400 t/s** | 10-second scheduler windows when GPU is dedicated to prefill (e.g. fresh request burst) |
-| 8K-token solo prefill | ~3-4 min | dominated by prefill, decoding ~300 output tokens after |
-| 8K-token × 3 parallel | **>10 min, hits client timeout** | KV cache pool fills, prefill chunks interleave with decode of other streams |
+**Full bench matrix** (measured 2026-05-02, production config: `util=0.55, max_model_len=65536, max_num_seqs=1`; streaming `/v1/chat/completions`, `temperature=0`, `max_tokens=2048`, 2 runs per cell, mean t/s reported. Min/max within 1% of mean: extremely deterministic.):
 
-**Right number to plan with: ~38 t/s.** The 100-400 t/s scheduler heartbeats are real but instantaneous bursts that don't last more than a few seconds. The user-perceived "how long until the model starts replying to my long prompt" question is governed by the per-request average, not the burst peak. Source: vLLM `vllm:request_prefill_time_seconds_sum / vllm:request_prompt_tokens_sum`, accumulated across all real workloads in our session.
+| ctx     | case        | prefill t/s | decode t/s |
+|---------|-------------|------------:|-----------:|
+| 0       | normal      | 98.6        | 12.40      |
+| 0       | thinking    | 118.5       | 23.80      |
+| 0       | no_thinking | 118.7       | 22.25      |
+| 2048    | normal      | 133.0       | 11.16      |
+| 2048    | thinking    | 133.8       | 18.99      |
+| 2048    | no_thinking | 134.5       | 20.30      |
+| 4096    | normal      | 131.2       | 9.85       |
+| 4096    | thinking    | 131.3       | 17.49      |
+| 4096    | no_thinking | 131.4       | 18.45      |
+| 8192    | normal      | 126.8       | 8.39       |
+| 8192    | thinking    | 127.5       | 13.66      |
+| 8192    | no_thinking | 127.1       | 13.58      |
+| 16384   | normal      | 118.9       | 5.90       |
+| 16384   | thinking    | 119.6       | 9.15       |
+| 16384   | no_thinking | 120.4       | 9.49       |
+| 32768   | normal      | 105.8       | 3.42       |
+| 32768   | thinking    | 106.6       | 4.59       |
+| 32768   | no_thinking | 106.3       | 4.61       |
+
+(`two_tools` cases omitted: model exits ~77 tokens after issuing two tool calls, so decode rate is a small-N artifact, not signal. Prefill numbers for `two_tools` track the other cases within 2%.)
+
+**What the kernel did fix.** Stock TritonW4A16 had two specific failure modes on gfx1151:
+- Tile shapes hard-coded for MI300 (304 CUs, wave64). gfx1151 is 40 CUs / wave32: bad occupancy at large M.
+- Dequant-to-fp16 strategy throws away INT8 WMMA throughput. Our kernel keeps int8 throughout and uses `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` (AMD WMMA v1, INT8), which is 2x peak per the AMD ISA docs.
+
+**What the kernel did NOT fix: long-context decode.** Past ~8k context, decode drops to single digits. That is **attention scaling on the KV cache**, not GEMM. The HIP kernel does not touch attention. Fixing it would mean a flash-attention-style KV-aware kernel, which is separate scope.
+
+Background and the original cliff curve live in [`.research/mmq-q4-gfx1151-port/FINDINGS.md`](.research/mmq-q4-gfx1151-port/FINDINGS.md) (the kernel port itself), [`.research/prefill-perf-experiments/CHANGELOG.md`](.research/prefill-perf-experiments/CHANGELOG.md), and [`.research/int4-wmma-rdna-path/FINDINGS.md`](.research/int4-wmma-rdna-path/FINDINGS.md).
 
 ---
 
@@ -141,15 +165,15 @@ This is the planning number for any `docker compose up`. We measured 8m27s, 8m44
 
 ### 🧩 Recommended setup for multi-tenant / RAG / agent serving
 
-**Profile we run as the daily driver** (also the one used for the multi-stream stress test below):
+**Daily-driver profile we ship as the .env defaults** (single-stream, HIP kernel on, comfortable memory budget):
 
 | Setting | Value | Rationale |
 |---|---|---|
-| `VLLM_MAX_NUM_SEQS` | `3` | three independent clients can decode at the same time (chat UI + RAG api + automation client) |
-| `VLLM_MAX_MODEL_LEN` | `131072` | half the native 256K context  -  cuts KV cache budget in half so each of the three slots gets ~7.87 GiB |
-| `VLLM_GPU_MEMORY_UTIL` | `0.5` | sets a 64 GiB cap on what vLLM may claim. **Actual measured idle footprint ≈ 50 GiB** (49.7 GiB GTT + ~0.8 GiB dedicated VRAM, read from `/sys/class/drm/card1/device/mem_info_*` on the running engine), leaving ~75 GiB of the 128 GB UMA pool free for sibling services on the same box |
+| `VLLM_MAX_NUM_SEQS` | `1` | single-stream is fast enough now that the prefill kernel landed; flat 105 to 134 t/s prefill from 0 to 32K context |
+| `VLLM_MAX_MODEL_LEN` | `65536` | 64K context. The HIP kernel's dual-storage cost (~22 GiB extra weight memory, see below) makes 128K tight at the 0.55 util cap; 64K is the comfortable production point |
+| `VLLM_GPU_MEMORY_UTIL` | `0.55` | sets a ~70 GiB cap on what vLLM may claim. Tuned to actual need (model weights + dual-storage + 64K KV pool), not maxed out. Leaves ~60 GiB of UMA free for sibling services. No swap pressure. |
 
-We **lowered `gpu_memory_utilization` from the default `0.9` to `0.5` and dropped `max_model_len` from `262144` to `131072`** specifically to share the box: vLLM no longer hoards VRAM, and 128K is more than enough context for almost any realistic tool-calling agent or RAG retrieval window.
+We **dropped `max_model_len` from `262144` to `65536` and dialed `gpu_memory_utilization` to `0.55`** specifically to fit the kernel's dual-storage cost without leaving the box swap-bound. Multi-stream still works (verified up to 3 concurrent in the [stress test below](#-multi-stream--tool-calling-stress-test-3-concurrent)), just bump `VLLM_MAX_NUM_SEQS` and either keep 64K or drop to 32K per slot.
 
 **What this fits alongside vLLM on the same Strix Halo box** (verified running concurrently):
 - this vLLM instance serving Qwen 3.6-27B
@@ -211,7 +235,7 @@ Per-position acceptance falls off as N grows (drafter is less confident predicti
 | Context | 256K | 256K | 256K |
 | Vision support | ✅ | ✅ | ✅ |
 | Hardware | AMD iGPU, ROCm 7.13 | NVIDIA GB10 Blackwell | NVIDIA GB10 Blackwell sm_121a |
-| Stack | Upstream vLLM v0.20.0 + 17 patches | Upstream vLLM | Custom CUDA 13 + FlashInfer 0.6.8 + sm_121a-only |
+| Stack | Upstream vLLM v0.20.0 + 18 patches (incl. local HIP MMQ kernel) | Upstream vLLM | Custom CUDA 13 + FlashInfer 0.6.8 + sm_121a-only |
 | Open source toolchain | 100% | mostly | partly (NVFP4 kernels are NVIDIA's) |
 
 **Sources cited above:**
@@ -281,7 +305,7 @@ wait
 ```bash
 docker compose build
 ```
-Multi-stage: TheRock ROCm 7.13 nightly tarball → PyTorch from `rocm.nightlies.amd.com/v2-staging/gfx1151/` → vLLM v0.20.0 source → 16 idempotent string-replace patches → C/HIP extensions for gfx1151.
+Multi-stage: TheRock ROCm 7.13 nightly tarball → PyTorch from `rocm.nightlies.amd.com/v2-staging/gfx1151/` → vLLM v0.20.0 source → 18 idempotent string-replace patches (incl. Patch 16 that registers the local AWQ-INT4 MMQ HIP kernel) → C/HIP extensions for gfx1151.
 
 ### 7. Boot the engine
 ```bash
@@ -300,25 +324,27 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 ### Tunable env vars (.env overrides)
-| var | default | meaning |
+| var | shipping default | meaning |
 |---|---|---|
 | `VLLM_DFLASH_N` | `8` | speculative tokens; higher = more parallelism, lower acceptance past ~8 |
-| `VLLM_GPU_MEMORY_UTIL` | `0.9` | KV cache budget |
-| `VLLM_MAX_NUM_SEQS` | `1` | bump to 3-10 for aggregate throughput (3 verified, see profiles below) |
-| `VLLM_MAX_MODEL_LEN` | `262144` | full Qwen 256K (drop to 131072 for half the KV cost) |
+| `VLLM_GPU_MEMORY_UTIL` | `0.55` | hard cap on UMA the engine may claim. Sized to actual need, not maxed out. At 0.55 vLLM reserves ~64 GiB and leaves ~60 GiB system free, no swap pressure. **Right-size to actual concurrency x context.** At low `MAX_NUM_SEQS` and high util vLLM allocates an oversized KV pool that sits unused. See [Recommended profiles](#recommended-profiles). |
+| `VLLM_MAX_NUM_SEQS` | `1` | concurrent decode slots. `1` is the daily-driver default since the HIP kernel landed (single-stream prefill is now fast enough that batching is no longer how you hide cost). Multi-stream still works (verified at 3, see profiles). |
+| `VLLM_MAX_MODEL_LEN` | `65536` | 64K context. Chosen because the kernel's dual-storage cost (~22 GiB extra weight memory for the M-dispatch fallback path) makes 128K tight at the 0.55 util cap. 64K is a comfortable production point and covers almost any agent / RAG retrieval window. Raise to `131072` or `262144` if you accept the tighter memory budget. |
+| `VLLM_MAX_NUM_BATCHED_TOKENS` | `8192` | scheduler token budget per iteration (vLLM v0.20.0 online-serving default). Bump to `16384` to let long prefills land in fewer chunks. Tradeoff: more KV pressure when batching many concurrent decodes. |
 | `VLLM_MODEL_ID` | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | target model |
 
 ### Recommended profiles
 
-| Profile | `MAX_NUM_SEQS` | `MAX_MODEL_LEN` | `GPU_MEMORY_UTIL` | Budget cap (util × UMA) | Use case |
+| Profile | `MAX_NUM_SEQS` | `MAX_MODEL_LEN` | `GPU_MEMORY_UTIL` | Budget cap (util x UMA) | Use case |
 |---|---|---|---|---|---|
-| **Single-user, max context** | `1` | `262144` | `0.9` | ~115 GiB cap | one chat at a time, full 256K |
-| **3-agent multi-stream** ⭐ | `3` | `131072` | `0.5` | **~64 GiB cap** (measured idle: ~50 GiB) | 3 simultaneous clients, 128K each, leaves room on the box for a RAG api / embedding service / TTS / etc. |
-| Aggressive 3-up | `3` | `131072` | `0.7` | ~90 GiB cap | 3 clients with more KV headroom (~120K usable per stream) |
+| **Single-stream + HIP kernel** ⭐ (shipping default) | `1` | `65536` | `0.55` | ~70 GiB cap (measured ~64 GiB, ~60 GiB free) | one client, full benefit of the prefill kernel, dual-storage weight cost fits comfortably; daily driver |
+| Single-user, max context | `1` | `262144` | `0.9` | ~115 GiB cap | one chat at a time, full 256K, accepts the tighter memory budget |
+| 3-agent multi-stream | `3` | `131072` | `0.7` | ~90 GiB cap | 3 simultaneous clients with KV headroom; HIP kernel still kicks in on prefill at M >= 32 |
+| 3-up, share the box | `3` | `65536` | `0.55` | ~70 GiB cap | 3 clients, 64K each, leaves room on the box for a RAG api / embedding service / TTS / etc. |
 
-> The "Budget cap" column is `gpu_memory_utilization × UMA pool size (128 GiB)`. It's a *ceiling*, not a target. Actual claimed memory is whatever vLLM's `profile_run` plus model weights plus KV cache pool actually need, which is usually well below the cap.
+> The "Budget cap" column is `gpu_memory_utilization x UMA pool size (128 GiB)`. It's a *ceiling*, not a target. Actual claimed memory is whatever vLLM's `profile_run` plus model weights plus KV cache pool actually need, which is usually well below the cap. **However**: at high util with low `MAX_NUM_SEQS`, vLLM still allocates a KV pool sized to fill that cap, and most of it goes unused (single-stream cannot consume an 80+ GiB KV pool). Right-size util to your concurrency x context, do not pick `0.9` reflexively. **The HIP MMQ kernel adds a one-time dual-storage cost**: ~22 GiB of extra weight memory holds the transposed TritonW4A16-format weights so decode (M < 32) can fall through to Triton without re-packing per call. This is why the shipping default drops `MAX_MODEL_LEN` from 256K to 64K: the dual-storage budget plus 64K KV per slot fits cleanly under a 0.55 util cap.
 
-**3-agent profile, what we ran today:** vLLM at `max_num_seqs=3, max_model_len=131072, gpu_memory_utilization=0.5` reports `Available KV cache memory: 23.61 GiB`, `GPU KV cache size: 82,368 tokens`. **Actual measured idle footprint: ~50 GiB** (49.7 GiB GTT + ~0.8 GiB dedicated VRAM, sysfs at `/sys/class/drm/card1/device/mem_info_gtt_used` and `mem_info_vram_used`). Breakdown: model weights ~28 GiB + KV pool 23.61 GiB ≈ 51 GiB; the cap is 64 GiB so ~14 GiB of headroom is left unclaimed within the cap. Verified with three concurrent clients: this vLLM serving Qwen, a RAG api stack on the same box (FastAPI + pgvector + 2× HuggingFace text-embeddings-inference on CPU + memgraph), and a piper TTS-backed web UI ([gladosproject](https://github.com/hec-ovi/gladosproject)). All three coexist without OOM or contention because:
+**Daily-driver profile, what we ship today:** vLLM at `max_num_seqs=1, max_model_len=65536, gpu_memory_utilization=0.55`. The kernel registration succeeds at startup (`Patch 16: RocmMmqQ4LinearKernel registered at _POSSIBLE_KERNELS[ROCM][0]` in the engine logs). Verified coexisting with three CPU-only sibling services: a RAG api stack (FastAPI + pgvector + 2x HuggingFace text-embeddings-inference + memgraph) and a Piper TTS-backed web UI ([gladosproject](https://github.com/hec-ovi/gladosproject)). All three coexist without OOM or contention because:
 
 - Embedding/reranker models run **CPU-only** (HF TEI `cpu-1.9` image)
 - Piper TTS runs **CPU-only** (`PiperVoice.load(use_cuda=False)` is the default; we don't override) - confirmed by inspecting `piper.voice` source
@@ -408,9 +434,24 @@ We don't fork vLLM. We cherry-pick two upstream PRs and add one local fix, all a
 </details>
 
 <details>
-<summary><b>14 hardware-enablement patches from kyuz0 (verbatim)</b></summary>
+<summary><b>Patch 16  -  local: register the AWQ-INT4 MMQ HIP custom op (Strix Halo prefill kernel)</b></summary>
 
-`scripts/patch_strix.py` patches 1-12 are kept verbatim from [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes) (Donato Capitella, the de-facto Strix Halo + vLLM stack maintainer). They handle:
+- **Status**: ships in this repo. The kernel itself lives at [`csrc/awq_mmq_gfx1151/`](csrc/awq_mmq_gfx1151/) and the `.so` is built inside the container against TheRock 7.13.0a + PyTorch 2.10. The patch is a six-line registration block appended to vLLM's mixed-precision linear-kernel dispatcher.
+- **Why we patch**: vLLM's stock `TritonW4A16LinearKernel` had two specific failure modes on gfx1151:
+  - Tile shapes hard-coded for MI300 (304 CUs, wave64). gfx1151 is 40 CUs / wave32: bad occupancy at large M, which is the prefill regime.
+  - Dequant-to-fp16 strategy throws away INT8 WMMA throughput. AMD WMMA v1's `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` is 2x peak vs the fp16 path on this silicon.
+- **Diff**: 17-line registration block appended to `vllm/model_executor/kernels/linear/__init__.py`. On engine startup it adds `/root/csrc/awq_mmq_gfx1151` to `sys.path`, imports `RocmMmqQ4LinearKernel` from `awq_mmq_gfx1151.vllm_kernel`, and inserts it at position 0 of `_POSSIBLE_KERNELS[PlatformEnum.ROCM]` so `choose_mp_linear_kernel` picks it ahead of `TritonW4A16LinearKernel` for the W4A16 g32 path. If the import fails (e.g. `.so` not built yet), the kernel list is left untouched and TritonW4A16 keeps its slot.
+- **What the kernel does**: ports llama.cpp's MMQ Q4 pattern verbatim. Weights stay int4 in registers, unpacked to int8 in LDS tiles, accumulated through chained WMMA iu8 calls into an i32 tile, with per-group (group_size=32) fp32 dequantization at K-group boundaries. Tile shapes `(mmq_x=48, mmq_y=64, nwarps=4)` are taken from the lhl/pedapudi gist for RDNA3_5 (master defaults of 128/128/8 spill VGPRs on gfx1151's 1536-VGPR-per-SIMD budget).
+- **Decode path is preserved bit-for-bit**: `apply_weights` in `vllm_kernel.py` dispatches on M. For M >= 32 (prefill) we use the HIP kernel; for M < 32 (decode, including DFlash N=8 spec rounds at M=8 typical) we fall through to `triton_w4a16_gemm` from vLLM's existing TritonW4A16, with weights pre-transposed at `process_weights_after_loading` time so there is no per-call repack. **Cost**: ~22 GiB of dual-storage weight memory. **Benefit**: the daily driver's 12 to 24 t/s decode floor is untouched.
+- **Verified live**: engine logs show `Patch 16: RocmMmqQ4LinearKernel registered at _POSSIBLE_KERNELS[ROCM][0]`. Bench matrix in [Prefill speed](#-prefill-input-processing-speed) confirms the flat 105 to 134 t/s curve; standalone correctness vs the scalar reference in [`csrc/awq_mmq_gfx1151/test_correctness.py`](csrc/awq_mmq_gfx1151/test_correctness.py).
+- Background and full kernel structure: [`.research/mmq-q4-gfx1151-port/FINDINGS.md`](.research/mmq-q4-gfx1151-port/FINDINGS.md).
+
+</details>
+
+<details>
+<summary><b>12 hardware-enablement patches from kyuz0 (verbatim) + 5 local additions</b></summary>
+
+`scripts/patch_strix.py` patches 1 through 10 (numbered 1, 1.5, 2, 3, 3.5, 5, 6, 7 [twice], 8, 9, 10, totaling 12 sub-patches) are kept verbatim from [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes) (Donato Capitella, the de-facto Strix Halo + vLLM stack maintainer). Patches 11 and 12 are small local additions on top of that base (hipCtx deprecation silence and a `qwen35` GGUF-arch alias). Patches 13, 14, 15 are local cherry-picks of upstream PRs and a small local fix (PR #40176 non-causal attn for DFlash, PR #40898 SWA support, and a `chat_template_kwargs` plumbing fix on `/v1/responses`). Patch 16 is the local registration of the AWQ-INT4 MMQ HIP custom op into vLLM's mixed-precision dispatcher (see the dedicated panel above). They handle:
 - `amdsmi` disable + `MagicMock` (Strix Halo APUs don't expose amdsmi in containers)
 - Force gfx1151 detection where vLLM falls back to gfx1100
 - Disable AITER FP8 linear / fused MoE / RMSNorm on gfx1x (CDNA-only assembly)
@@ -449,29 +490,47 @@ These are gfx1151-driven, not quant-driven. Same patches the BF16 sibling repo u
 ```
 .
 ├── Dockerfile               # multi-stage: Ubuntu + TheRock + torch + vLLM v0.20.0 from source
-├── docker-compose.yml       # one service, restart=no, --enforce-eager, DFlash N=8
+├── docker-compose.yml       # one service, restart=no, --enforce-eager, DFlash N=8, host-mounts ./csrc
 ├── .env.template            # the one config file you edit
 ├── glados.py                # tiny REPL/one-shot CLI for fast testing (no deps, stdlib only)
+├── csrc/
+│   └── awq_mmq_gfx1151/                  # HIP custom op: AWQ-INT4 MMQ Q4 prefill kernel for gfx1151
+│       ├── awq_mmq_gfx1151_kernel.hip    # v0 scalar reference + v1 WMMA iu8 (mmq_x=48, mmq_y=64, nwarps=4)
+│       ├── bindings.cpp                  # torch.ops.awq_mmq_gfx1151.mmq_q4_gemm dispatcher
+│       ├── setup.py                      # built inside the container, --offload-arch=gfx1151
+│       ├── awq_mmq_gfx1151/vllm_kernel.py # MPLinearKernel adapter + M-dispatch (M>=32 -> HIP, else Triton)
+│       └── test_correctness.py           # standalone correctness vs scalar reference
 ├── scripts/
-│   ├── install_rocm_sdk.sh  # TheRock nightly tarball → /opt/rocm (via rocm.nightlies.amd.com mirror, ~50× faster than the S3 origin from EU/non-US-East-2)
-│   ├── patch_strix.py       # 17 idempotent string-replace patches (1147 LOC) - 12 from kyuz0 (verbatim) + Patch 13/14 (PR cherry-picks) + Patch 15 (local fix for /v1/responses chat_template_kwargs)
+│   ├── install_rocm_sdk.sh  # TheRock nightly tarball -> /opt/rocm (rocm.nightlies.amd.com mirror, ~50x faster than S3 origin)
+│   ├── patch_strix.py       # 18 idempotent string-replace patches (1187 LOC) - 12 from kyuz0 (verbatim) + Patches 11/12 (local boilerplate) + Patches 13/14 (PR cherry-picks #40176, #40898) + Patch 15 (local /v1/responses chat_template_kwargs) + Patch 16 (register AWQ-INT4 MMQ HIP kernel into _POSSIBLE_KERNELS[ROCM][0])
 │   └── dump_logs.sh         # snapshot engine + kernel logs before any down/restart
 ├── test/
 │   ├── bench.py                       # original 5-endpoint harness (peso prompt)
 │   ├── bench_full.py                  # generic 5-endpoint + tools (chat+responses) + 2 images + Three.js
 │   ├── bench_longctx.py               # 25K-token synthesis test using real .research data
+│   ├── bench_matrix.py                # streaming bench matrix (ctx 0/2k/4k/8k/16k/32k x 4 cases) - the kernel-validation harness
+│   ├── bench_prefill_warmup.py        # cold-vs-warm prefill rate from /metrics deltas
 │   └── verify_responses_streaming.py  # SSE-traced T1-T5 reasoning/tool-call verification (post Patch 15)
 ├── LICENSE                  # Unlicense (public domain)
 └── README.md
 ```
 
-13 user-written files (plus `.gitignore`). No vendored binaries, no untracked tarballs.
+The kernel `.so` is built inside the container at startup (or out-of-band via `python setup.py build_ext --inplace` in `/workspace/csrc/awq_mmq_gfx1151/`); no vendored binaries, no untracked tarballs.
 
 ---
 
 ## 🔬 Run the benches
 
 ```bash
+# Streaming bench matrix: 6 contexts x 4 cases, the harness that produced the
+# Prefill table above. Use this after any kernel change to confirm the curve.
+python3 test/bench_matrix.py
+# -> test/bench_matrix_results.json (per-cell prefill / decode t/s, mean/min/max)
+
+# Cold-vs-warm 1k-token prefill from /metrics deltas (autotune amortization probe)
+python3 test/bench_prefill_warmup.py
+# -> stdout only
+
 # Streaming /v1/responses reasoning + tool-call verification (T1-T5 matrix)
 python3 test/verify_responses_streaming.py
 # -> per-test SSE event-type breakdown + reasoning/output_text channel char counts
@@ -506,7 +565,7 @@ Each script is self-contained and prints to stdout. Engine must already be runni
 
 ## ⚠️ Honest limitations
 
-- **`.env.template` defaults to single-stream** (`--max-num-seqs 1`). Multi-stream (up to **3 concurrent verified** in this session, see [profiles](#recommended-profiles) and [stress test](#-multi-stream--tool-calling-stress-test-3-concurrent)) works fine, just bump `VLLM_MAX_NUM_SEQS` and lower `MAX_MODEL_LEN`/`GPU_MEMORY_UTIL` to give the KV pool enough room.
+- **Shipping `.env` defaults to single-stream + 64K context** (`VLLM_MAX_NUM_SEQS=1`, `VLLM_MAX_MODEL_LEN=65536`, `VLLM_GPU_MEMORY_UTIL=0.55`). The HIP prefill kernel makes single-stream fast enough that batching is no longer how you hide cost. Multi-stream (up to **3 concurrent verified**, see [profiles](#recommended-profiles) and [stress test](#-multi-stream--tool-calling-stress-test-3-concurrent)) still works, just bump `VLLM_MAX_NUM_SEQS` and adjust `MAX_MODEL_LEN`/`GPU_MEMORY_UTIL`.
 - **Drafter is gated** on HuggingFace - manual approval required, no ungated mirror.
 - **Tool calling has two working modes and two broken modes.** Streaming tool calls on `/v1/chat/completions` have upstream parser bugs (vLLM PRs #40785, #40787 closed unmerged); non-streaming `/v1/responses` + tools when combined with `enable_thinking=false` is broken locally (channel routing, see Patch 15 scope below). Use `/v1/chat/completions` with `stream: false`, OR `/v1/responses` with `stream: true`. Full breakdown in [the tool calling support matrix](#%EF%B8%8F-tool-calling-support-matrix).
 - **Cold start ≈ 9 min on every restart**, even with all caches warm. Full breakdown in the dedicated [Spin-up time section](#%EF%B8%8F-spin-up-time-is-9-min-on-every-restart-even-with-all-caches-warm) above.
@@ -515,6 +574,8 @@ Each script is self-contained and prints to stdout. Engine must already be runni
 - **HIP graphs freeze on gfx1151** - `--enforce-eager` mandatory.
 - **Official `Qwen/Qwen3.6-27B-FP8` doesn't init** on RDNA 3.5 (Triton w8a8 autotune stall on the hybrid model's DeltaNet partitions). AWQ-INT4 sidesteps this and is structurally a better fit since RDNA 3.5 has no native FP8 anyway.
 - **Non-streaming `/v1/responses` with `enable_thinking=false` is NOT patched in this repo.** Patch 15 only covers the streaming path. The non-streaming path still misroutes content into the `reasoning` field and leaves tool-call XML unparsed. Use `stream: true` on `/v1/responses` for any agent or RAG client.
+- **Long-context decode is not what the HIP kernel fixed.** Past ~8K context, decode falls into single-digit t/s (5.9 t/s @ 16K, 3.4 t/s @ 32K on the `normal` case, see [Prefill table](#-prefill-input-processing-speed)). That is **attention scaling on the KV cache**, not GEMM, and it routes through a different code path the kernel does not touch. Fixing it would require a flash-attention-style KV-aware kernel (separate scope). Prefill itself stays flat at 105 to 134 t/s across the whole 0 to 32K range.
+- **Kernel adds a one-time ~22 GiB dual-storage weight cost.** `apply_weights` keeps two copies of the W4A16 weights so decode (M < 32) can fall through to `triton_w4a16_gemm` without per-call repack. This is why the shipping default is `MAX_MODEL_LEN=65536` and `GPU_MEMORY_UTIL=0.55` instead of the older 128K @ 0.5 profile. Raising to 128K or 256K still works, just tighter.
 
 ### 🚨 vLLM v0.20.0 qwen3 reasoning parser DOES NOT STREAM REASONING on `/v1/chat/completions`
 
